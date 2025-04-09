@@ -7,6 +7,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import precision_score,accuracy_score
 from datetime import datetime
 import os
+from tqdm import tqdm
 
 class TextEncoder(nn.Module):
     def __init__(self):
@@ -142,7 +143,51 @@ class MultimodalSentimentModel(nn.Module):
             'sentiment':sentiment_output,
         }
         
+def compute_class_weights(dataset):
+    emotion_counts=torch.zeros(7)
+    sentiment_counts=torch.zeros(3)
+    skipped=0
+    total=len(dataset)
+    
+    print("\nCounting Class distributions....")
+    for i in range(total):
+        sample=dataset[i]
         
+        if sample is None:
+            skipped+=1
+            continue
+        
+        emotion_label=sample['emotion_label']
+        sentiment_label=sample['sentiment_label']
+        
+        emotion_counts[emotion_label]+=1
+        sentiment_counts[sentiment_label]+=1
+        
+    valid=total-skipped
+    print(f"Skipped samples {skipped}/{total}")
+
+    print("\nClass Distribution")   
+    print("Emotions")
+    emotion_map={0:'anger',1:'disgust',2:'fear',3:'joy',4:'neutral',5:'sadness',6:'surprise'}    
+    for i,count in enumerate(emotion_counts):
+        print(f"{emotion_map[i]}:{count/valid:.2f}")
+    
+    print("\nSentiments:")
+    sentiment_map={0:'negative',1:'neutral',2:'positive'}
+    for i,count in enumerate(sentiment_counts):
+        print(f"{sentiment_map[i]}:{count/valid:.2f}")
+    
+    # Class weights calculation
+    emotion_weights=1.0/emotion_counts
+    sentiment_weights=1.0/sentiment_counts
+    
+    # Normalize weights
+    emotion_weights=emotion_weights/emotion_weights.sum()
+    sentiment_weights=sentiment_weights/sentiment_weights.sum()
+    
+    return emotion_weights,sentiment_weights
+    
+    
 class MultimodalTrainer():
     def __init__(self,model,train_loader,val_loader):
         self.model=model
@@ -179,40 +224,62 @@ class MultimodalTrainer():
             factor=0.2, #Factor
             patience=2.5
         )
+        self.current_train_losses=None
+        
+        print("\nCalculation of class weights")
+        emotion_weights,sentiment_weights=compute_class_weights(train_loader.dataset)
+        
+        device=next(model.parameters()).device
+        
+        self.emotion_weights=emotion_weights.to(device)
+        self.sentiment_weights=sentiment_weights.to(device)
+
+        print(f"Emotion weights of device:{self.emotion_weights.device}")
+        print(f"Sentiment weights of device:{self.sentiment_weights.device}")
         
         self.emotion_criterion=nn.CrossEntropyLoss(
-            label_smoothing=0.5
+            label_smoothing=0.5,
+            weight=self.emotion_weights
         )
         
         self.sentiment_criterion=nn.CrossEntropyLoss(
-            label_smoothing=0.5
+            label_smoothing=0.5,
+            weight=self.sentiment_weights
         )
-        
-        self.current_train_losses=None
-        
+
     def log_metrics(self,losses,metrics=None,phase="train"):
         if phase=="train":
             self.current_train_losses=losses
         else:
             self.writer.add_scalar('loss/total/train',self.current_train_losses['total'],self.global_step)
-            self.writer.add_scalar('loss/total/val',self.losses['total'],self.global_step)
+            self.writer.add_scalar('loss/total/val',losses['total'],self.global_step)
             
             self.writer.add_scalar('loss/emotion/train',self.current_train_losses['emotion'],self.global_step)
-            self.writer.add_scalar('loss/emotion/val',self.losses['emotion'],self.global_step)
+            self.writer.add_scalar('loss/emotion/val',losses['emotion'],self.global_step)
             
             self.writer.add_scalar('loss/sentiment/train',self.current_train_losses['sentiment'],self.global_step)
-            self.writer.add_scalar('loss/sentiment/val',self.losses['sentiment'],self.global_step)
+            self.writer.add_scalar('loss/sentiment/val',losses['sentiment'],self.global_step)
             
         if metrics:
             self.writer.add_scalar(
-                
+                f'{phase}/emotion_precision',metrics['emotion_precision'],self.global_step
+            )
+            self.writer.add_scalar(
+                f'{phase}/emotion_accuracy',metrics['emotion_accuracy'],self.global_step
+            )
+            self.writer.add_scalar(
+                f'{phase}/sentiment_precision',metrics['sentiment_precision'],self.global_step
+            )
+            self.writer.add_scalar(
+                f'{phase}/sentiment_accuracy',metrics['sentiment_accuracy'],self.global_step
             )
             
     def train_epoch(self):
         self.model.train()
         running_loss={'total':0,'emotion':0,'sentiment':0}
+        pbar=tqdm(self.train_loader, desc="Training")
         
-        for batch in self.train_loader:
+        for batch in pbar:
             device=next(self.model.parameters()).device
             text_inputs={
                 'input_ids':batch['text_inputs']['input_ids'].to(device),
@@ -221,7 +288,7 @@ class MultimodalTrainer():
             video_frames=batch['video_frames'].to(device)
             audio_features=batch['audio_features'].to(device)
             emotion_labels=batch['emotion_label'].to(device)
-            sentiment_labels=batch['sentiment_labels'].to(device)
+            sentiment_labels=batch['sentiment_label'].to(device)
             
             # Zero gradient
             self.optimizer.zero_grad()
@@ -251,8 +318,16 @@ class MultimodalTrainer():
             running_loss['total']+=total_loss.items()
             running_loss['sentiment']+=sentiment_loss.items()
             
+            self.log_metrics({
+                'total':total_loss.items(),
+                'emotion':emotion_loss.items(),
+                'sentiment':sentiment_loss.items(),
+            })
+            
             # Increment the global step
             self.global_step+=1
+            
+            
             
         return {k:v/len(self.train_loader) for k,v in running_loss.items()}   
     
@@ -264,8 +339,9 @@ class MultimodalTrainer():
         all_sentiment_preds=[]
         all_sentiment_labels=[]
         
+        pbar = tqdm(data_loader, desc=f"Evaluating ({phase})")
         with torch.inference_mode():
-            for batch in data_loader:
+            for batch in pbar:
                 device=next(self.model.parameters()).device
                 text_inputs={
                     'input_ids':batch['text_inputs']['input_ids'].to(device),
@@ -308,8 +384,16 @@ class MultimodalTrainer():
                 losses['emotion']+=emotion_loss.items()
                 losses['total']+=total_loss.items()
                 losses['sentiment']+=sentiment_loss.items()
-        
+    
         avg_loss={k:v/len(data_loader) for k, v in losses.items()}
+        
+        # Logging
+        self.log_metrics(avg_loss,{
+            'emotion precision':emotion_precision,
+            'sentiment precision':sentiment_precision,
+            'emotion accuracy':emotion_accuracy,
+            'sentiment accuracy':sentiment_accuracy,
+        },phase=phase)
         
         # Improve learning rate if no improvement seen for two consecutive epochs
         if phase=="val":

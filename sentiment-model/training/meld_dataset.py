@@ -167,7 +167,7 @@ def prepare_dataloaders(train_csv,train_video_dir,dev_csv,dev_video_dir,test_csv
     
     train_loader=DataLoader(train_dataset,batch_size=batch_size,shuffle=True,collate_fn=collate_fn)
     
-    dev_loader=DataLoader(dev_dataset,batch_size=batch_size,collate_fn=collate_fn)
+    dev_loader=DataLoader(dev_dataset,batch_size=batch_size,collate_fn=collate_fn) #VALIDATION
     
     test_loader=DataLoader(test_dataset,batch_size=batch_size,collate_fn=collate_fn)
     
