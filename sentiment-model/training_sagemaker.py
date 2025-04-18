@@ -29,9 +29,5 @@ def start_training():
         "test":"s3://bucket-name/dataset/test",
     })
     
-    
-
-
-
 if __name__=="__main__":
-    
+    start_training()
